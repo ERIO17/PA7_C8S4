@@ -1,0 +1,229 @@
+---
+title: "C8S4_Style_Exercise"
+author: "jlg"
+date: "28/06/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r g_setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r m_setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(dplyr)
+#library(tidyverse)
+
+clean_dataset <- function (testdf) {
+  testdf <- replace(testdf, testdf=="Not Available", NA)
+  # nettoyage data 1 : identifier variables ttes NA ou ttes vides
+  nrowdf<-nrow(testdf)
+  nlis1<-1
+  nlis2<-1
+  # try character()
+  list_na <- as.vector("")
+  list_empty <- as.vector("")
+  for ( i in names(testdf)) {
+    if(length(which(is.na(testdf[,i])))==nrowdf){
+      list_na[nlis1] <- i
+      nlis1 <- nlis1+1  
+    }
+  }
+  # nettoyage data 2 : verifier variables ttes NA ou ttes vides
+  nlis<-1
+  listlg1 <- as.vector(0)
+  for (i in list_na) {
+    listlg1[nlis]<-length(which(is.na(testdf[,i])))
+    nlis <- nlis+1  
+  }
+  return(list_na)
+}
+```
+# Project : Predicting style activity
+## Goal of this project
+Now collecting large amount of data about personal activity is relatively inexpensively with devices such as **Jawbone Up**, **Nike FuelBand**, and **Fitbit**. These type of devices are part of the quantified self movement, who incitate people to take measurements about themselves regularly to improve their health, to find patterns in their behavior. In this project, the **goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants** who were asked to perform barbell lifts correctly and incorrectly in 5 different ways, **to identify how well they did it** (outcome classe values A to E). 
+
+
+## Data and execution preparation
+### Read, clean and prepare the data for modeling
+These 2 datasets are provided with a **lot of quite empty columns** (only ~400 samples have quite complete 160 variables. The rest of the 19623 samples provided in the file pml-training.csv are incomplete  **and about 100 columns have each row set to NA**. So **no need to keep this columns**, they are deleted from the dataset.
+The **training data set will be separated in a training data set and a validation data set**.  
+
+
+```{r m_clean, echo=FALSE, message=FALSE, warning=FALSE}
+# lecture dataframe + cleaning + tri sur etat
+train_df <- read.csv("pml-training_phas2.csv")
+listsupcol <- clean_dataset(train_df)
+train_df <- select(train_df, -all_of(listsupcol))
+train_df <- select(train_df, -new_window)         # rf level >=2
+train_df$classe<- factor(train_df$classe, levels=c("A","B","C","D","E"))
+
+test_df <- read.csv("pml-testing.csv")
+listsupcol <- clean_dataset(test_df)
+test_df <- select(test_df, -all_of(listsupcol))
+test_df <- select(test_df, -c(new_window, problem_id)) # rf level >=2
+
+# get training and validation data set
+library(caret)
+inTrain<-createDataPartition(train_df$classe,p=3/4)[[1]]
+training<-train_df[inTrain,]
+validating<-train_df[-inTrain,]
+
+```
+
+### Preparing parallel execution
+The **rf model as gbm model** are particularly heavy **processor capacities consumators**. Then we can use **parallel execution to divide the total jobs in disjoints chunks and run theme concurrently**. Result are : lower time execution due to higher processor load. In this case without parallelization for one rf modelisation it took 18mn elapsed time with a 25% mean processor load, 60% memory versus 99% mean processor load, 93% memory and 13mn elapsed time with parallelization
+
+```{r m_parallel, echo=FALSE, message=FALSE, warning=FALSE}
+# Prepare parallel faster execution
+library(parallel)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1) # -1 =leave 1 core for OS
+registerDoParallel(cluster)
+```
+
+# Constructing and testing models 
+## Why choose random forest
+In a decision tree model, the data is splitted in small chunks and these samples are chosen according to a **purity measure**. That is, at each node, we want **information gain to be maximized**. For a regression problem, we consider residual sum of square (RSS) and for a classification problem, we consider the Gini index or entropy. 
+
+## Features selection
+Plotting **classe** versus **user_name** and sequential **X** shows that they generally all start exercise in class A and change toward upper letter class and for some of them a little intensity decrease at the end
+### Rank Features By Importance
+Running a first rf model on the training data set then the function **VarImp** on the descriptor of the model gives us this ranking table for the importance of the features (ten first) :
+<table>
+<tbody>
+<tr><td>X</td><td>100.0000</td></tr> 
+<tr><td>roll_belt</td><td>7.2014</td></tr> 
+<tr><td>pitch_forearm</td><td>2.0603</td></tr> 
+<tr><td>raw_timestamp_part_1</td><td>1.9917</td></tr> 
+<tr><td>accel_belt_z</td><td>1.6339</td></tr> 
+<tr><td>roll_dumbbell</td><td>1.0777</td></tr> 
+<tr><td>num_window</td><td>0.8352</td></tr> 
+<tr><td>accel_forearm_x</td><td>0.7579</td></tr> 
+<tr><td>magnet_dumbbell_y</td><td>0.7257</td></tr> 
+<tr><td>magnet_belt_y</td><td>0.6094</td></tr> 
+</tbody>
+</table>
+
+### Correlation matrix
+We also calculate the correlation matrix between the features given in this table, and it turns that features **raw_timestamp_part_1/num_window, roll_belt/accell_belt_z, yaw_belt/magnet_belt_y** are highly correlated.
+
+
+```{r  m_correl, echo=FALSE, message=FALSE, warning=FALSE}
+# calculate correlation matrix
+nco <-c(1,3,5:9,16,18,33,41,43:46,52)
+correlationMatrix <- cor(train_df[,c(1,3,6:9,16,18,33,41,43:46,52)])
+# find attributes that are highly corrected (ideally >0.75)
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.5)
+# summarize the correlation matrix
+
+```
+
+### Parameters when Running Random Forest models
+**Random Forest** aggregate best individual predictor. To make a prediction, we just obtain the predictions of all individuals trees, then predict the class that gets the most votes. So we will run the model rf with the **outcome classe** and the following predictors **roll_belt, pitch_forearm, roll_dumbbell, num_window, accel_forearm_x, magnet_dumbbell_y, cvtd_timestamp, total_accel_belt, yaw_belt+roll_forearm, pitch_belt, magnet_dumbbell_z, accel_dumbbell_y**.
+
+### Arguments :
+- **ntree**: number of trees in the forest 
+- **mtry**: Number of candidates draw to feed the algorithm. By default, it is the square of the number of columns.  
+- **maxnodes**: Set the maximum amount of terminal nodes in the forest  
+- **importance=TRUE**: Whether independent variables importance in the random forest be assessed  
+**K-fold cross validation** is controlled by the **trainControl()** function whose main arguments are :   **method = cv**: The method used to resample the dataset,  **number = n**: Number of folders to create, search = **grid**: Use the search grid method. For randomized method, use **grid**.  
+By default, the train function chooses the model with the largest performance value.
+For the first model **modFitrf1** : **ntree = 350**, default value for **mtry**.
+
+```{r m_modelel1, echo=FALSE, message=FALSE, cache=TRUE, warning=FALSE}
+# modelisation rf
+library(caret)
+library(AppliedPredictiveModeling)
+tc = trainControl(method = "cv", number=10)
+repGrid <- expand.grid(.mtry=c(4))  # no ntree
+set.seed(33933)
+system.time(modFitrf1<-train(classe~roll_belt+pitch_forearm+roll_dumbbell+num_window+
+                              +accel_forearm_x+magnet_dumbbell_y+cvtd_timestamp+
+                              +total_accel_belt+yaw_belt+roll_forearm+pitch_belt+
+                              +magnet_dumbbell_z+accel_dumbbell_y,
+                            metric="Accuracy", ntree=350,
+                            data=training, method="rf", 
+                            trControl=tc, tuneGrid = repGrid))
+predclass1 <- predict(modFitrf1, validating[,-59])
+conf1 <- confusionMatrix(predclass1, validating[,59])
+Accuracy_model1 <- conf1$overall
+
+```
+
+### Tuning the model and choose the Final Model
+We try now tuning two parameters, namely the **mtry and the ntree parameters** who are  the most likely to have the biggest effect on our final accuracy.
+**mtry** parameter has effect on the final accuracy but it must be found empirically for a dataset.
+The **ntree** parameter is different in that it can be as large as you like, and continues to increases the accuracy up to some point. It is less difficult or critical to tune and could be limited more by compute time available more than anything.
+We focus on ntree parameter to improve our model accuracy, set **ntree to 200** and set **mtry to sqrt(ncol(training)-1)** for the **modFitrf2** model
+
+```{r m_modelel2, echo=FALSE, message=FALSE, cache=TRUE, warning=FALSE}
+tc = trainControl(method = "cv", number=10)
+mtry <- sqrt(ncol(training)-1)
+repGrid <- expand.grid(mtry=mtry)
+set.seed(33933)
+system.time(modFitrf2<-train(classe~roll_belt+pitch_forearm+roll_dumbbell+num_window+
+                               +accel_forearm_x+magnet_dumbbell_y+cvtd_timestamp+
+                               +total_accel_belt+yaw_belt+roll_forearm+pitch_belt+
+                               +magnet_dumbbell_z+accel_dumbbell_y,
+                             metric="Accuracy", ntree=200,
+                             data=training, method="rf", 
+                             trControl=tc, tuneGrid = repGrid))
+predclass2 <- predict(modFitrf2, validating[,-59])
+conf2 <- confusionMatrix(predclass2, validating[,59])
+Accuracy_model2 <- conf2$overall
+predclass3 <- predict(modFitrf2, test_df)
+
+```
+
+# Conclusion
+Adjusting Random Forest parameters permitted to lower time execution (2 execution summaries above)  and improve the quality of the prediction of the models as shown below. 
+Here are the values for the 2 models **modFitrf1, modFitrf2** :
+
+```{css, echo=FALSE}
+.watch-out {
+  background-color: white;
+  border: 3px solid red;
+  font-weight: bold;
+}
+```
+```{r class.source="watch-out"}
+Accuracy_model1
+Accuracy_model2
+```
+
+
+We can now produce the **prediction for the 20 samples from the testing** data set :
+\textcolor{red}{`r predclass3`}
+```{r class.source="watch-out"}
+predclass3
+```
+
+\pagebreak
+# Appendix
+# Confusion Matrix for the 2 tested models on validating data set
+```{css, echo=FALSE}
+.watch-out {
+  background-color: white;
+  font-weight: bold;
+}
+```
+
+###  modFitrf1 with ntree = 350 and default mtry
+```{r app_1, echo=FALSE, message=FALSE}
+print(conf1)
+```
+```{css, echo=FALSE}
+.watch-out {
+  background-color: white;
+  font-weight: bold;
+}
+```
+
+###  modFitrf2 with ntree = 200 and mtry = sqrt(ncol(training)-1)
+```{r app_2, echo=FALSE, message=FALSE}
+print(conf2)
+```
